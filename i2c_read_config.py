@@ -2,16 +2,16 @@
 """
 Raspberry Pi I2C master for the ESP32 VocalPoint shared-state frame.
 
-Frame format (92 bytes, little-endian):
+Frame format (114 bytes, little-endian):
   [0]      magic (0xA5)
   [1]      version (0x01)
   [2..5]   seq (uint32)
   [6]      volume (uint8)
   [7]      battery (uint8)
-  [8..25]  BLE address string (18 bytes, null-terminated/padded)
-  [26..57] param1 string (32 bytes, null-terminated/padded)
-  [58..89] param2 string (32 bytes, null-terminated/padded)
-  [90..91] crc16-ccitt over bytes [0..89], little-endian
+  [8..47]  BLE address string (40 bytes, null-terminated/padded)
+  [48..79] param1 string (32 bytes, null-terminated/padded)
+  [80..111] param2 string (32 bytes, null-terminated/padded)
+  [112..113] crc16-ccitt over bytes [0..111], little-endian
 
 ESP32 TX buffer holds up to 4 frames. The read window is set to 4x the
 frame size so find_latest_frame() can scan all buffered frames and return
@@ -39,7 +39,7 @@ VP_FRAME_VERSION_LEN = 1
 VP_SEQ_MAX_LEN = 4
 VP_VOLUME_LEN = 1
 VP_BATTERY_LEN = 1
-VP_BLE_ADDR_MAX_LEN = 18
+VP_BLE_ADDR_MAX_LEN = 40
 VP_PARAM_MAX_LEN = 32
 VP_CRC16_LEN = 2
 
