@@ -20,13 +20,21 @@ import argparse
 import json
 import time
 from dataclasses import asdict, dataclass
+from typing import Any, Callable, Iterator
 
-from smbus2 import SMBus, i2c_msg
+try:
+    from smbus2 import SMBus, i2c_msg
+except ModuleNotFoundError:
+    SMBus = Any  # type: ignore[assignment]
+    i2c_msg = None
 
 FRAME_MAGIC = 0xA5
 FRAME_VERSION = 0x01
 WRITE_SETTLE_SEC = 0.01
 READ_RETRY_COUNT = 3
+DEFAULT_BUS = 1
+DEFAULT_ADDRESS = 0x42
+DEFAULT_INTERVAL_MS = 50
 
 VP_MAGIC_BIT_LEN = 1
 VP_FRAME_VERSION_LEN = 1
@@ -51,6 +59,16 @@ FRAME_SIZE = (
     + VP_CRC16_LEN
 )
 DEFAULT_READ_WINDOW = FRAME_SIZE * 3
+
+
+@dataclass(frozen=True)
+class I2CReaderConfig:
+    bus: int = DEFAULT_BUS
+    address: int = DEFAULT_ADDRESS
+    interval_ms: int = DEFAULT_INTERVAL_MS
+    write: str = ""
+    read_window: int = DEFAULT_READ_WINDOW
+    retries: int = READ_RETRY_COUNT
 
 
 @dataclass
@@ -104,12 +122,12 @@ def parse_frame(frame: bytes) -> DeviceState:
     volume = frame[6]
     battery = frame[7]
 
-    p = 8
-    ble_addr = decode_fixed_string(frame[p : p + BLE_ADDR_MAX_LEN])
-    p += BLE_ADDR_MAX_LEN
-    param1 = decode_fixed_string(frame[p : p + PARAM_MAX_LEN])
-    p += PARAM_MAX_LEN
-    param2 = decode_fixed_string(frame[p : p + PARAM_MAX_LEN])
+    offset = 8
+    ble_addr = decode_fixed_string(frame[offset : offset + BLE_ADDR_MAX_LEN])
+    offset += BLE_ADDR_MAX_LEN
+    param1 = decode_fixed_string(frame[offset : offset + PARAM_MAX_LEN])
+    offset += PARAM_MAX_LEN
+    param2 = decode_fixed_string(frame[offset : offset + PARAM_MAX_LEN])
 
     return DeviceState(
         seq=seq,
@@ -139,7 +157,29 @@ def find_valid_frame(raw: bytes) -> bytes:
     raise ValueError(f"no valid frame found in read window, prefix={prefix}")
 
 
+def validate_reader_config(config: I2CReaderConfig) -> None:
+    if config.bus < 0:
+        raise ValueError("bus must be non-negative")
+    if not 0 <= config.address <= 0x7F:
+        raise ValueError("address must be in range 0x00..0x7F")
+    if config.interval_ms < 0:
+        raise ValueError("interval_ms must be non-negative")
+    if config.read_window < FRAME_SIZE:
+        raise ValueError(f"read_window must be at least {FRAME_SIZE}")
+    if config.retries < 1:
+        raise ValueError("retries must be at least 1")
+
+
+def require_smbus2() -> None:
+    if i2c_msg is None:
+        raise RuntimeError(
+            "smbus2 is required for I2C access. Install it on the Raspberry Pi with "
+            "'python3 -m pip install smbus2'."
+        )
+
+
 def i2c_read_window(bus: SMBus, address: int, size: int) -> bytes:
+    require_smbus2()
     read_msg = i2c_msg.read(address, size)
     bus.i2c_rdwr(read_msg)
     return bytes(read_msg)
@@ -162,25 +202,72 @@ def i2c_read_frame(bus: SMBus, address: int, read_window: int, retry_count: int)
 
 
 def i2c_write_tokens(bus: SMBus, address: int, token_string: str) -> None:
-    data = token_string.encode("utf-8")
-    write_msg = i2c_msg.write(address, data)
+    require_smbus2()
+    write_msg = i2c_msg.write(address, token_string.encode("utf-8"))
     bus.i2c_rdwr(write_msg)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Poll ESP32 shared-state frame over I2C.")
-    parser.add_argument("--bus", type=int, default=1, help="I2C bus number (default: 1)")
+def read_device_state(bus: SMBus, config: I2CReaderConfig) -> DeviceState:
+    if config.write:
+        i2c_write_tokens(bus, config.address, config.write)
+        time.sleep(WRITE_SETTLE_SEC)
+
+    frame = i2c_read_frame(bus, config.address, config.read_window, config.retries)
+    return parse_frame(frame)
+
+
+def poll_device_states(
+    config: I2CReaderConfig,
+    *,
+    dedupe_seq: bool = True,
+    on_error: Callable[[Exception], None] | None = None,
+) -> Iterator[DeviceState]:
+    validate_reader_config(config)
+    require_smbus2()
+
+    last_seq: int | None = None
+    with SMBus(config.bus) as bus:
+        while True:
+            try:
+                state = read_device_state(bus, config)
+                if not dedupe_seq or state.seq != last_seq:
+                    last_seq = state.seq
+                    yield state
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                if on_error is None:
+                    raise
+                on_error(exc)
+
+            time.sleep(config.interval_ms / 1000.0)
+
+
+def format_device_state(state: DeviceState) -> str:
+    return (
+        f"seq={state.seq} volume={state.volume} battery={state.battery} "
+        f"addr='{state.ble_addr}' p1='{state.param1}' p2='{state.param2}'"
+    )
+
+
+def add_reader_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--bus",
+        type=int,
+        default=DEFAULT_BUS,
+        help=f"I2C bus number (default: {DEFAULT_BUS})",
+    )
     parser.add_argument(
         "--address",
-        type=lambda x: int(x, 0),
-        default=0x42,
-        help="7-bit I2C slave address (default: 0x42)",
+        type=lambda value: int(value, 0),
+        default=DEFAULT_ADDRESS,
+        help=f"7-bit I2C slave address (default: 0x{DEFAULT_ADDRESS:02X})",
     )
     parser.add_argument(
         "--interval-ms",
         type=int,
-        default=50,
-        help="Polling interval in milliseconds (default: 50)",
+        default=DEFAULT_INTERVAL_MS,
+        help=f"Polling interval in milliseconds (default: {DEFAULT_INTERVAL_MS})",
     )
     parser.add_argument(
         "--write",
@@ -192,7 +279,10 @@ def main() -> int:
         "--read-window",
         type=int,
         default=DEFAULT_READ_WINDOW,
-        help=f"Number of bytes to read for frame resynchronization (default: {DEFAULT_READ_WINDOW})",
+        help=(
+            "Number of bytes to read for frame resynchronization "
+            f"(default: {DEFAULT_READ_WINDOW})"
+        ),
     )
     parser.add_argument(
         "--retries",
@@ -200,44 +290,48 @@ def main() -> int:
         default=READ_RETRY_COUNT,
         help=f"Number of read windows to scan before failing (default: {READ_RETRY_COUNT})",
     )
+
+
+def reader_config_from_args(args: argparse.Namespace) -> I2CReaderConfig:
+    return I2CReaderConfig(
+        bus=args.bus,
+        address=args.address,
+        interval_ms=args.interval_ms,
+        write=args.write,
+        read_window=args.read_window,
+        retries=args.retries,
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Poll ESP32 shared-state frame over I2C.")
+    add_reader_arguments(parser)
     parser.add_argument("--json", action="store_true", help="Print decoded state as JSON")
     args = parser.parse_args()
 
-    if args.read_window < FRAME_SIZE:
-        raise SystemExit(f"--read-window must be at least {FRAME_SIZE}")
+    config = reader_config_from_args(args)
+    validate_reader_config(config)
 
     print(
-        f"Polling I2C bus={args.bus} addr=0x{args.address:02X} "
-        f"interval={args.interval_ms}ms frame={FRAME_SIZE} bytes window={args.read_window}"
+        f"Polling I2C bus={config.bus} addr=0x{config.address:02X} "
+        f"interval={config.interval_ms}ms frame={FRAME_SIZE} bytes "
+        f"window={config.read_window}"
     )
 
-    last_seq: int | None = None
-    with SMBus(args.bus) as bus:
-        while True:
-            try:
-                if args.write:
-                    i2c_write_tokens(bus, args.address, args.write)
-                    time.sleep(WRITE_SETTLE_SEC)
+    try:
+        for state in poll_device_states(
+            config,
+            on_error=lambda exc: print(f"read error: {exc}"),
+        ):
+            if args.json:
+                print(json.dumps(asdict(state), separators=(",", ":")))
+            else:
+                print(format_device_state(state))
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return 0
 
-                frame = i2c_read_frame(bus, args.address, args.read_window, args.retries)
-                state = parse_frame(frame)
-
-                if last_seq != state.seq:
-                    if args.json:
-                        print(json.dumps(asdict(state), separators=(",", ":")))
-                    else:
-                        print(
-                            f"seq={state.seq} volume={state.volume} battery={state.battery} "
-                            f"addr='{state.ble_addr}' p1='{state.param1}' p2='{state.param2}'"
-                        )
-                    last_seq = state.seq
-            except KeyboardInterrupt:
-                print("\nStopped.")
-                return 0
-            except Exception as exc:
-                print(f"read error: {exc}")
-
-            time.sleep(args.interval_ms / 1000.0)
+    return 0
 
 
 if __name__ == "__main__":
