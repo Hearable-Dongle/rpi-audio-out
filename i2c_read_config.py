@@ -31,7 +31,7 @@ except ModuleNotFoundError:
 FRAME_MAGIC = 0xA5
 FRAME_VERSION = 0x01
 WRITE_SETTLE_SEC = 0.01
-READ_RETRY_COUNT = 3
+READ_RETRY_COUNT = 1
 DEFAULT_BUS = 1
 DEFAULT_ADDRESS = 0x42
 DEFAULT_INTERVAL_MS = 50
@@ -58,7 +58,8 @@ FRAME_SIZE = (
     + VP_PARAM_MAX_LEN
     + VP_CRC16_LEN
 )
-DEFAULT_READ_WINDOW = FRAME_SIZE * 3
+DEFAULT_READ_WINDOW = FRAME_SIZE
+DEFAULT_RESYNC_READ_WINDOW = FRAME_SIZE * 3
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,7 @@ class I2CReaderConfig:
     write: str = ""
     read_window: int = DEFAULT_READ_WINDOW
     retries: int = READ_RETRY_COUNT
+    resync_read: bool = False
 
 
 @dataclass
@@ -168,6 +170,12 @@ def validate_reader_config(config: I2CReaderConfig) -> None:
         raise ValueError(f"read_window must be at least {FRAME_SIZE}")
     if config.retries < 1:
         raise ValueError("retries must be at least 1")
+    if not config.resync_read and config.read_window != FRAME_SIZE:
+        raise ValueError(
+            f"read_window must be exactly {FRAME_SIZE} unless resync_read is enabled"
+        )
+    if not config.resync_read and config.retries != 1:
+        raise ValueError("retries must be 1 unless resync_read is enabled")
 
 
 def require_smbus2() -> None:
@@ -183,6 +191,10 @@ def i2c_read_window(bus: SMBus, address: int, size: int) -> bytes:
     read_msg = i2c_msg.read(address, size)
     bus.i2c_rdwr(read_msg)
     return bytes(read_msg)
+
+
+def i2c_read_exact_frame(bus: SMBus, address: int) -> bytes:
+    return i2c_read_window(bus, address, FRAME_SIZE)
 
 
 def i2c_read_frame(bus: SMBus, address: int, read_window: int, retry_count: int) -> bytes:
@@ -212,7 +224,10 @@ def read_device_state(bus: SMBus, config: I2CReaderConfig) -> DeviceState:
         i2c_write_tokens(bus, config.address, config.write)
         time.sleep(WRITE_SETTLE_SEC)
 
-    frame = i2c_read_frame(bus, config.address, config.read_window, config.retries)
+    if config.resync_read:
+        frame = i2c_read_frame(bus, config.address, config.read_window, config.retries)
+    else:
+        frame = i2c_read_exact_frame(bus, config.address)
     return parse_frame(frame)
 
 
@@ -280,7 +295,7 @@ def add_reader_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=DEFAULT_READ_WINDOW,
         help=(
-            "Number of bytes to read for frame resynchronization "
+            "Number of bytes to read when --resync-read is enabled "
             f"(default: {DEFAULT_READ_WINDOW})"
         ),
     )
@@ -288,7 +303,15 @@ def add_reader_arguments(parser: argparse.ArgumentParser) -> None:
         "--retries",
         type=int,
         default=READ_RETRY_COUNT,
-        help=f"Number of read windows to scan before failing (default: {READ_RETRY_COUNT})",
+        help=f"Number of resync read attempts before failing (default: {READ_RETRY_COUNT})",
+    )
+    parser.add_argument(
+        "--resync-read",
+        action="store_true",
+        help=(
+            "Enable larger read-window scanning for frame resynchronization. "
+            "Disabled by default to preserve the original direct 92-byte read behavior."
+        ),
     )
 
 
@@ -300,6 +323,7 @@ def reader_config_from_args(args: argparse.Namespace) -> I2CReaderConfig:
         write=args.write,
         read_window=args.read_window,
         retries=args.retries,
+        resync_read=args.resync_read,
     )
 
 
@@ -314,9 +338,12 @@ def main() -> int:
 
     print(
         f"Polling I2C bus={config.bus} addr=0x{config.address:02X} "
-        f"interval={config.interval_ms}ms frame={FRAME_SIZE} bytes "
-        f"window={config.read_window}"
+        f"interval={config.interval_ms}ms frame={FRAME_SIZE} bytes"
     )
+    if config.resync_read:
+        print(
+            f"Resync mode enabled: window={config.read_window} retries={config.retries}"
+        )
 
     try:
         for state in poll_device_states(
