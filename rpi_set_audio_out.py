@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import select
 import subprocess
 import time
 from dataclasses import dataclass
@@ -92,6 +93,51 @@ def normalize_device_name(value: str) -> str:
     return normalize_identifier(value)
 
 
+def start_bluetoothctl_session(config: BluetoothAudioConfig) -> subprocess.Popen[str]:
+    try:
+        return subprocess.Popen(
+            [config.bluetoothctl_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"bluetoothctl not found at {config.bluetoothctl_path!r}"
+        ) from exc
+
+
+def write_session_command(process: subprocess.Popen[str], command: str) -> None:
+    assert process.stdin is not None
+    process.stdin.write(command + "\n")
+    process.stdin.flush()
+
+
+def read_session_output(
+    process: subprocess.Popen[str],
+    duration_sec: float,
+) -> str:
+    assert process.stdout is not None
+    output_chunks: list[str] = []
+    deadline = time.monotonic() + duration_sec
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        ready, _, _ = select.select([process.stdout], [], [], min(0.2, remaining))
+        if not ready:
+            continue
+        line = process.stdout.readline()
+        if not line:
+            break
+        output_chunks.append(line)
+
+    return "".join(output_chunks)
+
+
 def parse_param1_target(param1: str) -> DeviceTarget:
     raw = param1.strip()
     if not raw:
@@ -131,6 +177,43 @@ def parse_bluetooth_devices(output: str) -> list[BluetoothDevice]:
 
     devices.extend(seen.values())
     return devices
+
+
+def match_devices_by_target(
+    devices: list[BluetoothDevice],
+    target: DeviceTarget,
+    config: BluetoothAudioConfig,
+) -> tuple[BluetoothDevice, bool]:
+    name_matches = [
+        device
+        for device in devices
+        if normalize_device_name(device.name) == normalize_device_name(target.name)
+    ]
+
+    if not name_matches:
+        raise LookupError(f"no Bluetooth device found with name {target.name!r}")
+
+    if target.uuid:
+        normalized_uuid = normalize_identifier(target.uuid)
+        uuid_matches: list[BluetoothDevice] = []
+        for device in name_matches:
+            info_output = get_device_info(device.address, config)
+            if normalized_uuid and normalized_uuid in normalize_identifier(info_output):
+                uuid_matches.append(device)
+
+        if len(uuid_matches) == 1:
+            return uuid_matches[0], True
+        if len(uuid_matches) > 1:
+            raise LookupError(
+                f"multiple Bluetooth devices matched name {target.name!r} and UUID {target.uuid!r}"
+            )
+
+    if len(name_matches) == 1:
+        return name_matches[0], False
+
+    raise LookupError(
+        f"multiple Bluetooth devices matched name {target.name!r}; UUID verification did not disambiguate"
+    )
 
 
 def run_bluetoothctl_scan(config: BluetoothAudioConfig) -> str:
@@ -181,84 +264,62 @@ def list_bluetooth_devices(config: BluetoothAudioConfig) -> list[BluetoothDevice
     return parse_bluetooth_devices(result.stdout + result.stderr)
 
 
-def find_device_by_target(
-    target: DeviceTarget,
-    config: BluetoothAudioConfig,
-) -> tuple[BluetoothDevice, bool]:
-    devices = list_bluetooth_devices(config)
-    name_matches = [
-        device
-        for device in devices
-        if normalize_device_name(device.name) == normalize_device_name(target.name)
-    ]
-
-    if not name_matches:
-        raise LookupError(f"no Bluetooth device found with name {target.name!r}")
-
-    if target.uuid:
-        normalized_uuid = normalize_identifier(target.uuid)
-        uuid_matches: list[BluetoothDevice] = []
-        for device in name_matches:
-            info_output = get_device_info(device.address, config)
-            if normalized_uuid and normalized_uuid in normalize_identifier(info_output):
-                uuid_matches.append(device)
-
-        if len(uuid_matches) == 1:
-            return uuid_matches[0], True
-        if len(uuid_matches) > 1:
-            raise LookupError(
-                f"multiple Bluetooth devices matched name {target.name!r} and UUID {target.uuid!r}"
-            )
-
-    if len(name_matches) == 1:
-        return name_matches[0], False
-
-    raise LookupError(
-        f"multiple Bluetooth devices matched name {target.name!r}; UUID verification did not disambiguate"
-    )
-
-
 def connect_audio_output(
     address: str,
     config: BluetoothAudioConfig | None = None,
 ) -> BluetoothConnectionResult:
     resolved_config = config or BluetoothAudioConfig()
     normalized_address = normalize_ble_address(address)
+    process = start_bluetoothctl_session(resolved_config)
+    transcript: list[str] = []
 
     try:
-        info_output = get_device_info(normalized_address, resolved_config)
+        if resolved_config.power_on:
+            write_session_command(process, "power on")
+            transcript.append(read_session_output(process, 0.5))
+
+        write_session_command(process, "agent NoInputNoOutput")
+        transcript.append(read_session_output(process, 0.5))
+        write_session_command(process, "default-agent")
+        transcript.append(read_session_output(process, 0.5))
+
+        write_session_command(process, f"info {normalized_address}")
+        info_output = read_session_output(process, 1.0)
+        transcript.append(info_output)
         if "Connected: yes" in info_output:
+            write_session_command(process, "quit")
+            transcript.append(read_session_output(process, 0.5))
             return BluetoothConnectionResult(
                 address=normalized_address,
                 success=True,
                 already_connected=True,
-                output=info_output,
+                output="".join(transcript),
             )
 
-        commands: list[str] = []
-        if resolved_config.power_on:
-            commands.extend(["power on", "agent on", "default-agent"])
         if resolved_config.pair:
-            commands.append(f"pair {normalized_address}")
+            write_session_command(process, f"pair {normalized_address}")
+            transcript.append(read_session_output(process, 8.0))
         if resolved_config.trust:
-            commands.append(f"trust {normalized_address}")
-        commands.extend(
-            [
-                f"connect {normalized_address}",
-                f"info {normalized_address}",
-            ]
-        )
-        result = run_bluetoothctl(commands, resolved_config)
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            f"bluetoothctl not found at {resolved_config.bluetoothctl_path!r}"
-        ) from exc
+            write_session_command(process, f"trust {normalized_address}")
+            transcript.append(read_session_output(process, 1.0))
+
+        write_session_command(process, f"connect {normalized_address}")
+        transcript.append(read_session_output(process, 8.0))
+        write_session_command(process, f"info {normalized_address}")
+        transcript.append(read_session_output(process, 1.5))
+        write_session_command(process, "quit")
+        transcript.append(read_session_output(process, 0.5))
+        process.wait(timeout=resolved_config.command_timeout_sec)
     except subprocess.TimeoutExpired as exc:
+        process.kill()
         raise RuntimeError(
             f"bluetoothctl timed out after {resolved_config.command_timeout_sec}s"
         ) from exc
+    finally:
+        if process.poll() is None:
+            process.kill()
 
-    output = result.stdout + result.stderr
+    output = "".join(transcript)
     success = is_connected_output(output)
     return BluetoothConnectionResult(
         address=normalized_address,
@@ -266,6 +327,67 @@ def connect_audio_output(
         already_connected=False,
         output=output,
     )
+
+
+def connect_audio_output_by_target(
+    target: DeviceTarget,
+    config: BluetoothAudioConfig | None = None,
+) -> tuple[BluetoothDevice, bool, BluetoothConnectionResult]:
+    resolved_config = config or BluetoothAudioConfig()
+    process = start_bluetoothctl_session(resolved_config)
+    transcript: list[str] = []
+
+    try:
+        if resolved_config.power_on:
+            write_session_command(process, "power on")
+            transcript.append(read_session_output(process, 0.5))
+
+        write_session_command(process, "agent NoInputNoOutput")
+        transcript.append(read_session_output(process, 0.5))
+        write_session_command(process, "default-agent")
+        transcript.append(read_session_output(process, 0.5))
+
+        write_session_command(process, "scan on")
+        transcript.append(read_session_output(process, resolved_config.scan_timeout_sec))
+        write_session_command(process, "devices")
+        transcript.append(read_session_output(process, 1.0))
+
+        devices = parse_bluetooth_devices("".join(transcript))
+        device, uuid_verified = match_devices_by_target(devices, target, resolved_config)
+
+        if resolved_config.pair:
+            write_session_command(process, f"pair {device.address}")
+            transcript.append(read_session_output(process, 8.0))
+        if resolved_config.trust:
+            write_session_command(process, f"trust {device.address}")
+            transcript.append(read_session_output(process, 1.0))
+
+        write_session_command(process, f"connect {device.address}")
+        transcript.append(read_session_output(process, 8.0))
+        write_session_command(process, f"info {device.address}")
+        transcript.append(read_session_output(process, 1.5))
+        write_session_command(process, "scan off")
+        transcript.append(read_session_output(process, 0.5))
+        write_session_command(process, "quit")
+        transcript.append(read_session_output(process, 0.5))
+        process.wait(timeout=resolved_config.command_timeout_sec)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        raise RuntimeError(
+            f"bluetoothctl timed out after {resolved_config.command_timeout_sec}s"
+        ) from exc
+    finally:
+        if process.poll() is None:
+            process.kill()
+
+    output = "".join(transcript)
+    result = BluetoothConnectionResult(
+        address=device.address,
+        success=is_connected_output(output),
+        already_connected="Connected: yes" in output and "Connection successful" not in output,
+        output=output,
+    )
+    return device, uuid_verified, result
 
 
 def add_bluetooth_arguments(parser: argparse.ArgumentParser) -> None:
@@ -363,24 +485,22 @@ def main() -> int:
     try:
         if args.address:
             target_address = args.address
+            result = connect_audio_output(
+                target_address,
+                config=bluetooth_config_from_args(args),
+            )
         else:
             if args.name:
                 target = DeviceTarget(name=args.name, uuid=args.uuid)
             else:
                 target = resolve_saved_target(args.state_path)
 
-            device, uuid_verified = find_device_by_target(
+            device, uuid_verified, result = connect_audio_output_by_target(
                 target,
-                bluetooth_config_from_args(args),
+                config=bluetooth_config_from_args(args),
             )
             verification = " with UUID verification" if uuid_verified else ""
             print(f"resolved {device.name!r} to {device.address}{verification}")
-            target_address = device.address
-
-        result = connect_audio_output(
-            target_address,
-            config=bluetooth_config_from_args(args),
-        )
     except Exception as exc:
         print(f"connection setup failed: {exc}")
         return 1
