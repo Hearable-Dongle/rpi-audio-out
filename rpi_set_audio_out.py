@@ -9,6 +9,9 @@ import argparse
 import re
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
+
+from device_state_store import DEFAULT_STATE_PATH, load_saved_ble_address
 
 BLE_ADDRESS_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 DEFAULT_BLUETOOTHCTL = "bluetoothctl"
@@ -155,13 +158,26 @@ def bluetooth_config_from_args(args: argparse.Namespace) -> BluetoothAudioConfig
     )
 
 
+def resolve_connect_address(address: str | None, state_path: Path) -> str:
+    if address:
+        return address
+    return load_saved_ble_address(state_path)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Attempt to connect Raspberry Pi audio output to a Bluetooth device."
     )
     parser.add_argument(
         "address",
+        nargs="?",
         help="Bluetooth MAC address to connect to, e.g. AA:BB:CC:DD:EE:FF",
+    )
+    parser.add_argument(
+        "--state-path",
+        type=Path,
+        default=DEFAULT_STATE_PATH,
+        help=f"Path to the saved device state from i2c_read_config.py (default: {DEFAULT_STATE_PATH})",
     )
     add_bluetooth_arguments(parser)
     parser.add_argument(
@@ -171,10 +187,15 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    result = connect_audio_output(
-        args.address,
-        config=bluetooth_config_from_args(args),
-    )
+    try:
+        target_address = resolve_connect_address(args.address, args.state_path)
+        result = connect_audio_output(
+            target_address,
+            config=bluetooth_config_from_args(args),
+        )
+    except Exception as exc:
+        print(f"connection setup failed: {exc}")
+        return 1
 
     if result.success:
         if result.already_connected:
