@@ -11,7 +11,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from device_state_store import DEFAULT_STATE_PATH, load_saved_ble_address
+from device_state_store import DEFAULT_STATE_PATH, load_saved_ble_address, load_shared_state
 
 BLE_ADDRESS_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 DEFAULT_BLUETOOTHCTL = "bluetoothctl"
@@ -33,6 +33,18 @@ class BluetoothConnectionResult:
     success: bool
     already_connected: bool
     output: str
+
+
+@dataclass(frozen=True)
+class BluetoothDevice:
+    address: str
+    name: str
+
+
+@dataclass(frozen=True)
+class DeviceTarget:
+    name: str
+    uuid: str | None = None
 
 
 def normalize_ble_address(address: str) -> str:
@@ -64,6 +76,92 @@ def get_device_info(address: str, config: BluetoothAudioConfig) -> str:
 
 def is_connected_output(output: str) -> bool:
     return "Connected: yes" in output or "Connection successful" in output
+
+
+def normalize_identifier(value: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", value.lower())
+
+
+def parse_param1_target(param1: str) -> DeviceTarget:
+    raw = param1.strip()
+    if not raw:
+        raise ValueError("param1 is empty")
+
+    parts = [part.strip() for part in raw.split(";") if part.strip()]
+    keyed: dict[str, str] = {}
+    for part in parts:
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        keyed[key.strip().lower()] = value.strip()
+
+    if "name" in keyed:
+        return DeviceTarget(name=keyed["name"], uuid=keyed.get("uuid"))
+
+    for separator in ("|", ","):
+        if separator in raw:
+            left, right = (part.strip() for part in raw.split(separator, 1))
+            if left and right:
+                return DeviceTarget(name=right, uuid=left)
+
+    raise ValueError(
+        "param1 must contain a device name and optional UUID, for example "
+        "'UUID=<id>;NAME=<device>' or '<uuid>|<name>'"
+    )
+
+
+def list_bluetooth_devices(config: BluetoothAudioConfig) -> list[BluetoothDevice]:
+    result = run_bluetoothctl(["devices"], config)
+    output = result.stdout + result.stderr
+    devices: list[BluetoothDevice] = []
+
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("Device "):
+            continue
+        parts = line.split(" ", 2)
+        if len(parts) < 3:
+            continue
+        devices.append(BluetoothDevice(address=parts[1], name=parts[2].strip()))
+
+    return devices
+
+
+def find_device_by_target(
+    target: DeviceTarget,
+    config: BluetoothAudioConfig,
+) -> tuple[BluetoothDevice, bool]:
+    devices = list_bluetooth_devices(config)
+    name_matches = [
+        device
+        for device in devices
+        if device.name.strip().casefold() == target.name.strip().casefold()
+    ]
+
+    if not name_matches:
+        raise LookupError(f"no Bluetooth device found with name {target.name!r}")
+
+    if target.uuid:
+        normalized_uuid = normalize_identifier(target.uuid)
+        uuid_matches: list[BluetoothDevice] = []
+        for device in name_matches:
+            info_output = get_device_info(device.address, config)
+            if normalized_uuid and normalized_uuid in normalize_identifier(info_output):
+                uuid_matches.append(device)
+
+        if len(uuid_matches) == 1:
+            return uuid_matches[0], True
+        if len(uuid_matches) > 1:
+            raise LookupError(
+                f"multiple Bluetooth devices matched name {target.name!r} and UUID {target.uuid!r}"
+            )
+
+    if len(name_matches) == 1:
+        return name_matches[0], False
+
+    raise LookupError(
+        f"multiple Bluetooth devices matched name {target.name!r}; UUID verification did not disambiguate"
+    )
 
 
 def connect_audio_output(
@@ -158,10 +256,17 @@ def bluetooth_config_from_args(args: argparse.Namespace) -> BluetoothAudioConfig
     )
 
 
-def resolve_connect_address(address: str | None, state_path: Path) -> str:
-    if address:
-        return address
-    return load_saved_ble_address(state_path)
+def resolve_saved_target(state_path: Path) -> DeviceTarget | None:
+    state = load_shared_state(state_path)
+    param1 = str(state.get("param1", "")).strip()
+    if param1:
+        return parse_param1_target(param1)
+
+    ble_addr = str(state.get("ble_addr", "")).strip()
+    if ble_addr:
+        return None
+
+    raise ValueError(f"saved state at {state_path} does not contain param1 or ble_addr")
 
 
 def main() -> int:
@@ -172,6 +277,14 @@ def main() -> int:
         "address",
         nargs="?",
         help="Bluetooth MAC address to connect to, e.g. AA:BB:CC:DD:EE:FF",
+    )
+    parser.add_argument(
+        "--name",
+        help="Bluetooth device name to match manually",
+    )
+    parser.add_argument(
+        "--uuid",
+        help="Optional device UUID or identifier to verify while matching by name",
     )
     parser.add_argument(
         "--state-path",
@@ -188,7 +301,27 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        target_address = resolve_connect_address(args.address, args.state_path)
+        if args.address:
+            target_address = args.address
+        else:
+            if args.name:
+                target = DeviceTarget(name=args.name, uuid=args.uuid)
+            else:
+                target = resolve_saved_target(args.state_path)
+
+            if target is None:
+                target_address = load_saved_ble_address(args.state_path)
+            else:
+                device, uuid_verified = find_device_by_target(
+                    target,
+                    bluetooth_config_from_args(args),
+                )
+                verification = " with UUID verification" if uuid_verified else ""
+                print(
+                    f"resolved {device.name!r} to {device.address}{verification}"
+                )
+                target_address = device.address
+
         result = connect_audio_output(
             target_address,
             config=bluetooth_config_from_args(args),
