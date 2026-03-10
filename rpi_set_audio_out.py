@@ -11,7 +11,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from device_state_store import DEFAULT_STATE_PATH, load_saved_ble_address, load_shared_state
+from device_state_store import DEFAULT_STATE_PATH, load_shared_state
 
 BLE_ADDRESS_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 DEFAULT_BLUETOOTHCTL = "bluetoothctl"
@@ -104,10 +104,7 @@ def parse_param1_target(param1: str) -> DeviceTarget:
             if left and right:
                 return DeviceTarget(name=right, uuid=left)
 
-    raise ValueError(
-        "param1 must contain a device name and optional UUID, for example "
-        "'UUID=<id>;NAME=<device>' or '<uuid>|<name>'"
-    )
+    return DeviceTarget(name=raw)
 
 
 def list_bluetooth_devices(config: BluetoothAudioConfig) -> list[BluetoothDevice]:
@@ -262,11 +259,7 @@ def resolve_saved_target(state_path: Path) -> DeviceTarget | None:
     if param1:
         return parse_param1_target(param1)
 
-    ble_addr = str(state.get("ble_addr", "")).strip()
-    if ble_addr:
-        return None
-
-    raise ValueError(f"saved state at {state_path} does not contain param1 or ble_addr")
+    raise ValueError(f"saved state at {state_path} does not contain param1")
 
 
 def main() -> int:
@@ -309,18 +302,13 @@ def main() -> int:
             else:
                 target = resolve_saved_target(args.state_path)
 
-            if target is None:
-                target_address = load_saved_ble_address(args.state_path)
-            else:
-                device, uuid_verified = find_device_by_target(
-                    target,
-                    bluetooth_config_from_args(args),
-                )
-                verification = " with UUID verification" if uuid_verified else ""
-                print(
-                    f"resolved {device.name!r} to {device.address}{verification}"
-                )
-                target_address = device.address
+            device, uuid_verified = find_device_by_target(
+                target,
+                bluetooth_config_from_args(args),
+            )
+            verification = " with UUID verification" if uuid_verified else ""
+            print(f"resolved {device.name!r} to {device.address}{verification}")
+            target_address = device.address
 
         result = connect_audio_output(
             target_address,
