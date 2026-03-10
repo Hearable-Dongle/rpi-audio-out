@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,12 +17,17 @@ from device_state_store import DEFAULT_STATE_PATH, load_shared_state
 BLE_ADDRESS_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 DEFAULT_BLUETOOTHCTL = "bluetoothctl"
 DEFAULT_COMMAND_TIMEOUT_SEC = 30.0
+DEFAULT_SCAN_TIMEOUT_SEC = 10.0
+DEVICE_LINE_RE = re.compile(
+    r"(?:\[[^\]]+\]\s+)?Device\s+([0-9A-Fa-f:]{17})\s+(.+)$"
+)
 
 
 @dataclass(frozen=True)
 class BluetoothAudioConfig:
     bluetoothctl_path: str = DEFAULT_BLUETOOTHCTL
     command_timeout_sec: float = DEFAULT_COMMAND_TIMEOUT_SEC
+    scan_timeout_sec: float = DEFAULT_SCAN_TIMEOUT_SEC
     pair: bool = True
     trust: bool = True
     power_on: bool = True
@@ -82,6 +88,10 @@ def normalize_identifier(value: str) -> str:
     return re.sub(r"[^0-9a-z]", "", value.lower())
 
 
+def normalize_device_name(value: str) -> str:
+    return normalize_identifier(value)
+
+
 def parse_param1_target(param1: str) -> DeviceTarget:
     raw = param1.strip()
     if not raw:
@@ -107,21 +117,68 @@ def parse_param1_target(param1: str) -> DeviceTarget:
     return DeviceTarget(name=raw)
 
 
-def list_bluetooth_devices(config: BluetoothAudioConfig) -> list[BluetoothDevice]:
-    result = run_bluetoothctl(["devices"], config)
-    output = result.stdout + result.stderr
+def parse_bluetooth_devices(output: str) -> list[BluetoothDevice]:
     devices: list[BluetoothDevice] = []
+    seen: dict[str, BluetoothDevice] = {}
 
     for line in output.splitlines():
         line = line.strip()
-        if not line.startswith("Device "):
+        match = DEVICE_LINE_RE.search(line)
+        if match is None:
             continue
-        parts = line.split(" ", 2)
-        if len(parts) < 3:
-            continue
-        devices.append(BluetoothDevice(address=parts[1], name=parts[2].strip()))
+        device = BluetoothDevice(address=match.group(1), name=match.group(2).strip())
+        seen[device.address] = device
 
+    devices.extend(seen.values())
     return devices
+
+
+def run_bluetoothctl_scan(config: BluetoothAudioConfig) -> str:
+    try:
+        process = subprocess.Popen(
+            [config.bluetoothctl_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"bluetoothctl not found at {config.bluetoothctl_path!r}"
+        ) from exc
+
+    assert process.stdin is not None
+    assert process.stdout is not None
+
+    try:
+        if config.power_on:
+            process.stdin.write("power on\n")
+        process.stdin.write("scan on\n")
+        process.stdin.flush()
+        time.sleep(config.scan_timeout_sec)
+        process.stdin.write("devices\n")
+        process.stdin.write("scan off\n")
+        process.stdin.write("quit\n")
+        process.stdin.flush()
+        output, _ = process.communicate(timeout=config.command_timeout_sec)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        output, _ = process.communicate()
+        raise RuntimeError(
+            f"bluetoothctl scan timed out after {config.command_timeout_sec}s"
+        ) from exc
+
+    return output
+
+
+def list_bluetooth_devices(config: BluetoothAudioConfig) -> list[BluetoothDevice]:
+    output = run_bluetoothctl_scan(config)
+    devices = parse_bluetooth_devices(output)
+    if devices:
+        return devices
+
+    result = run_bluetoothctl(["devices"], config)
+    return parse_bluetooth_devices(result.stdout + result.stderr)
 
 
 def find_device_by_target(
@@ -132,7 +189,7 @@ def find_device_by_target(
     name_matches = [
         device
         for device in devices
-        if device.name.strip().casefold() == target.name.strip().casefold()
+        if normalize_device_name(device.name) == normalize_device_name(target.name)
     ]
 
     if not name_matches:
@@ -227,6 +284,15 @@ def add_bluetooth_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--scan-timeout-sec",
+        type=float,
+        default=DEFAULT_SCAN_TIMEOUT_SEC,
+        help=(
+            "How long to scan for nearby Bluetooth devices before matching by name "
+            f"(default: {DEFAULT_SCAN_TIMEOUT_SEC})"
+        ),
+    )
+    parser.add_argument(
         "--no-pair",
         action="store_true",
         help="Skip bluetoothctl pair before connect",
@@ -247,6 +313,7 @@ def bluetooth_config_from_args(args: argparse.Namespace) -> BluetoothAudioConfig
     return BluetoothAudioConfig(
         bluetoothctl_path=args.bluetoothctl_path,
         command_timeout_sec=args.bt_timeout_sec,
+        scan_timeout_sec=args.scan_timeout_sec,
         pair=not args.no_pair,
         trust=not args.no_trust,
         power_on=not args.no_power_on,
