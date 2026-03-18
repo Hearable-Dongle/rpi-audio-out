@@ -77,13 +77,15 @@ PARAM_FLAG_TO_FIELD: dict[int, str] = {
 }
 
 # How long to wait after writing a request before reading the response.
-# The ESP32 bridge task wakes on the incoming write and prepares its TX buffer;
-# 20 ms gives it ample time even at task tick granularity (1 ms FreeRTOS tick).
-SETTLE_SEC = 0.020
+# The ESP32 bridge task wakes on the incoming write and prepares its TX buffer.
+# A slightly larger gap is more robust when BLE activity and I2C handling share
+# a single ESP32-C3 core.
+SETTLE_SEC = 0.050
 
-# How many times to retry a param read if the response header doesn't match.
-# One retry is enough to recover from a single TX-buffer contamination event.
-PARAM_RETRY_COUNT = 1
+# How many times to retry reads if the response header doesn't match.
+# Stale bytes can leave the slave TX FIFO misaligned by one transaction.
+STATUS_RETRY_COUNT = 2
+PARAM_RETRY_COUNT = 2
 
 # Maximum response the ESP32 will ever send (VP_RESP_ADDR_LEN = 4 + 40 = 44).
 # Used by the startup drain to flush any leftover bytes from a previous session.
@@ -115,7 +117,7 @@ def _read_bytes(bus: SMBus, address: int, n: int) -> bytes:
     return bytes(msg)
 
 
-def drain_tx_buffer(bus: SMBus, address: int) -> None:
+def drain_tx_buffer(bus: SMBus, address: int, attempts: int = 4) -> None:
     """
     Discard any bytes left in the ESP32's TX FIFO from a previous session.
 
@@ -126,10 +128,18 @@ def drain_tx_buffer(bus: SMBus, address: int) -> None:
     already empty the slave will NACK and smbus2 raises OSError — we ignore
     that here because an empty buffer is the desired end-state.
     """
-    try:
-        _read_bytes(bus, address, VP_RESP_MAX_LEN)
-    except OSError:
-        pass  # buffer was already empty — that's fine
+    for _ in range(attempts):
+        try:
+            _read_bytes(bus, address, VP_RESP_MAX_LEN)
+        except OSError:
+            break  # buffer was already empty — that's fine
+
+
+def _expect_exact_flags(resp_flags: int, expected_flags: int, kind: str) -> None:
+    if resp_flags != expected_flags:
+        raise ValueError(
+            f"{kind} flags mismatch: expected 0x{expected_flags:08X} got 0x{resp_flags:08X}"
+        )
 
 
 # ── Protocol helpers ─────────────────────────────────────────────────────────
@@ -141,10 +151,25 @@ def read_status(bus: SMBus, address: int) -> int:
     Returns the 32-bit flags value.  VP_FLAG_CHANGED (bit 0) indicates that
     at least one parameter has changed; the individual VP_FLAG_* bits say which.
     """
-    _write_request(bus, address, 0x00000000)
-    time.sleep(SETTLE_SEC)
-    raw = _read_bytes(bus, address, VP_STATUS_LEN)
-    return struct.unpack("<I", raw)[0]
+    last_err: ValueError | None = None
+
+    for attempt in range(STATUS_RETRY_COUNT + 1):
+        if attempt > 0:
+            drain_tx_buffer(bus, address)
+
+        _write_request(bus, address, 0x00000000)
+        time.sleep(SETTLE_SEC)
+        raw = _read_bytes(bus, address, VP_STATUS_LEN)
+        flags = struct.unpack("<I", raw)[0]
+
+        # Status replies must not contain the param-response marker.
+        if flags & VP_REQ_DATA:
+            last_err = ValueError(f"status read returned param header: 0x{flags:08X}")
+            continue
+
+        return flags
+
+    raise last_err  # type: ignore[misc]
 
 
 def read_param(bus: SMBus, address: int, param_bit: int) -> bytes:
@@ -168,9 +193,8 @@ def read_param(bus: SMBus, address: int, param_bit: int) -> bytes:
     last_err: ValueError | None = None
 
     for attempt in range(PARAM_RETRY_COUNT + 1):
-        if attempt > 0:
-            # Drain any stale bytes before re-issuing the request.
-            drain_tx_buffer(bus, address)
+        # Drain any late or stale bytes before issuing the next request.
+        drain_tx_buffer(bus, address)
 
         req = VP_REQ_DATA | param_bit
         _write_request(bus, address, req)
@@ -179,14 +203,10 @@ def read_param(bus: SMBus, address: int, param_bit: int) -> bytes:
         raw = _read_bytes(bus, address, total)
 
         resp_flags = struct.unpack("<I", raw[:VP_RESP_HDR_LEN])[0]
-        if not (resp_flags & VP_REQ_DATA):
-            last_err = ValueError(f"response missing VP_REQ_DATA: 0x{resp_flags:08X}")
-            continue
-        if not (resp_flags & param_bit):
-            last_err = ValueError(
-                f"response param bit mismatch: requested 0x{param_bit:08X} "
-                f"got 0x{resp_flags:08X}"
-            )
+        try:
+            _expect_exact_flags(resp_flags, req, "param response")
+        except ValueError as exc:
+            last_err = exc
             continue
 
         return raw[VP_RESP_HDR_LEN:]
