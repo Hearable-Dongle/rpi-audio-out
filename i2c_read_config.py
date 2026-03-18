@@ -1,27 +1,35 @@
 #!/usr/bin/env python3
 """
-Raspberry Pi I2C master for the ESP32 VocalPoint shared-state frame.
+Raspberry Pi I2C master for the ESP32 VocalPoint shared-state bridge.
 
-Frame format (114 bytes, little-endian):
-  [0]      magic (0xA5)
-  [1]      version (0x01)
-  [2..5]   seq (uint32)
-  [6]      volume (uint8)
-  [7]      battery (uint8)
-  [8..47]  BLE address string (40 bytes, null-terminated/padded)
-  [48..79] param1 string (32 bytes, null-terminated/padded)
-  [80..111] param2 string (32 bytes, null-terminated/padded)
-  [112..113] crc16-ccitt over bytes [0..111], little-endian
+Protocol overview
+-----------------
+All communication is RPi-initiated (RPi = master, ESP32 = slave at 0x42).
+The RPi always WRITES a 4-byte request first, waits SETTLE_SEC, then READs
+the response.  The ESP32 never streams proactively.
 
-ESP32 TX buffer holds up to 4 frames. The read window is set to 4x the
-frame size so find_latest_frame() can scan all buffered frames and return
-the one with the highest sequence number, rather than the oldest.
+Request register (4 bytes, little-endian uint32):
+  0x00000000            → read status register
+  VP_REQ_DATA | <param> → read a specific parameter
+
+Status register response (4 bytes, little-endian uint32):
+  bit 0  VP_FLAG_CHANGED   at least one field changed since last fetch
+  bit 2  VP_FLAG_VOL       volume changed
+  bit 3  VP_FLAG_BAT       battery changed
+  bit 4  VP_FLAG_ADDR      BLE address changed
+  bit 5  VP_FLAG_P1        param1 changed
+  bit 6  VP_FLAG_P2        param2 changed
+
+Param response (4-byte flags header + N-byte payload):
+  [0..3]  uint32 flags (VP_REQ_DATA | param_bit)
+  [4..]   raw value (sizes: vol/bat=1, addr=40, p1/p2=32 bytes)
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import struct
 import time
 from dataclasses import asdict, dataclass
 
@@ -29,161 +37,193 @@ from smbus2 import SMBus, i2c_msg
 
 from device_state_store import DEFAULT_STATE_PATH, save_shared_state
 
-FRAME_MAGIC = 0xA5
-FRAME_VERSION = 0x01
-WRITE_SETTLE_SEC = 0.01
-READ_RETRY_COUNT = 3
+# ── Protocol constants (must match i2c_protocol.h) ──────────────────────────
 
-VP_MAGIC_BIT_LEN = 1
-VP_FRAME_VERSION_LEN = 1
-VP_SEQ_MAX_LEN = 4
-VP_VOLUME_LEN = 1
-VP_BATTERY_LEN = 1
-VP_BLE_ADDR_MAX_LEN = 40
-VP_PARAM_MAX_LEN = 32
-VP_CRC16_LEN = 2
+VP_FLAG_CHANGED = 1 << 0
+VP_FLAG_VOL     = 1 << 2
+VP_FLAG_BAT     = 1 << 3
+VP_FLAG_ADDR    = 1 << 4
+VP_FLAG_P1      = 1 << 5
+VP_FLAG_P2      = 1 << 6
 
-FRAME_SIZE = (
-    VP_MAGIC_BIT_LEN
-    + VP_FRAME_VERSION_LEN
-    + VP_SEQ_MAX_LEN
-    + VP_VOLUME_LEN
-    + VP_BATTERY_LEN
-    + VP_BLE_ADDR_MAX_LEN
-    + VP_PARAM_MAX_LEN
-    + VP_PARAM_MAX_LEN
-    + VP_CRC16_LEN
-)
+VP_REQ_DATA = 1 << 1
+VP_REQ_VOL  = 1 << 2
+VP_REQ_BAT  = 1 << 3
+VP_REQ_ADDR = 1 << 4
+VP_REQ_P1   = 1 << 5
+VP_REQ_P2   = 1 << 6
 
-DEFAULT_READ_WINDOW = FRAME_SIZE * 4
+VP_PARAM_BITS = VP_FLAG_VOL | VP_FLAG_BAT | VP_FLAG_ADDR | VP_FLAG_P1 | VP_FLAG_P2
 
+VP_STATUS_LEN   = 4
+VP_RESP_HDR_LEN = 4
+
+# Bytes of payload for each param bit (excluding the 4-byte header)
+PARAM_PAYLOAD_SIZES: dict[int, int] = {
+    VP_FLAG_VOL:  1,
+    VP_FLAG_BAT:  1,
+    VP_FLAG_ADDR: 40,
+    VP_FLAG_P1:   32,
+    VP_FLAG_P2:   32,
+}
+
+# Maps a param flag bit to the DeviceState field name
+PARAM_FLAG_TO_FIELD: dict[int, str] = {
+    VP_FLAG_VOL:  "volume",
+    VP_FLAG_BAT:  "battery",
+    VP_FLAG_ADDR: "ble_addr",
+    VP_FLAG_P1:   "param1",
+    VP_FLAG_P2:   "param2",
+}
+
+# How long to wait after writing a request before reading the response.
+# The ESP32 bridge task wakes on the incoming write and prepares its TX buffer;
+# 20 ms gives it ample time even at task tick granularity (1 ms FreeRTOS tick).
+SETTLE_SEC = 0.020
+
+# How many times to retry a param read if the response header doesn't match.
+# One retry is enough to recover from a single TX-buffer contamination event.
+PARAM_RETRY_COUNT = 1
+
+# Maximum response the ESP32 will ever send (VP_RESP_ADDR_LEN = 4 + 40 = 44).
+# Used by the startup drain to flush any leftover bytes from a previous session.
+VP_RESP_MAX_LEN = 44
+
+
+# ── State dataclass ──────────────────────────────────────────────────────────
 
 @dataclass
 class DeviceState:
-    seq: int
-    volume: int
-    battery: int
-    ble_addr: str
-    param1: str
-    param2: str
+    volume:   int  = 0
+    battery:  int  = 0
+    ble_addr: str  = ""
+    param1:   str  = ""
+    param2:   str  = ""
 
 
-def crc16_ccitt(data: bytes) -> int:
-    crc = 0xFFFF
-    for b in data:
-        crc ^= b << 8
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
-            else:
-                crc = (crc << 1) & 0xFFFF
-    return crc
+# ── Low-level I2C helpers ────────────────────────────────────────────────────
+
+def _write_request(bus: SMBus, address: int, flags: int) -> None:
+    """Write a 4-byte little-endian request register to the ESP32."""
+    data = list(struct.pack("<I", flags))
+    bus.i2c_rdwr(i2c_msg.write(address, data))
 
 
-def decode_fixed_string(raw: bytes) -> str:
+def _read_bytes(bus: SMBus, address: int, n: int) -> bytes:
+    msg = i2c_msg.read(address, n)
+    bus.i2c_rdwr(msg)
+    return bytes(msg)
+
+
+def drain_tx_buffer(bus: SMBus, address: int) -> None:
+    """
+    Discard any bytes left in the ESP32's TX FIFO from a previous session.
+
+    The ESP32 TX buffer is a ring FIFO.  If the RPi process was interrupted
+    mid-read (crash, restart), leftover bytes sit at the head of the FIFO and
+    will prefix the next read, corrupting framing.  Reading VP_RESP_MAX_LEN
+    bytes consumes at most one full leftover response.  If the buffer is
+    already empty the slave will NACK and smbus2 raises OSError — we ignore
+    that here because an empty buffer is the desired end-state.
+    """
+    try:
+        _read_bytes(bus, address, VP_RESP_MAX_LEN)
+    except OSError:
+        pass  # buffer was already empty — that's fine
+
+
+# ── Protocol helpers ─────────────────────────────────────────────────────────
+
+def read_status(bus: SMBus, address: int) -> int:
+    """
+    Request and read the ESP32 status register.
+
+    Returns the 32-bit flags value.  VP_FLAG_CHANGED (bit 0) indicates that
+    at least one parameter has changed; the individual VP_FLAG_* bits say which.
+    """
+    _write_request(bus, address, 0x00000000)
+    time.sleep(SETTLE_SEC)
+    raw = _read_bytes(bus, address, VP_STATUS_LEN)
+    return struct.unpack("<I", raw)[0]
+
+
+def read_param(bus: SMBus, address: int, param_bit: int) -> bytes:
+    """
+    Request and read a single parameter from the ESP32.
+
+    param_bit must be one of the VP_FLAG_* / VP_REQ_* constants (they share
+    the same bit positions for bits 2-6).
+
+    Returns the raw payload bytes (length per PARAM_PAYLOAD_SIZES).
+
+    Retries once on header mismatch to handle the TX-buffer contamination
+    edge case: the ESP32 clears the dirty bit as soon as it queues the
+    response; if the RPi reads stale leftover bytes instead, a single retry
+    re-issues the same request and gets a fresh response.
+
+    Raises ValueError if the header still doesn't match after the retry.
+    """
+    payload_size = PARAM_PAYLOAD_SIZES[param_bit]
+    total = VP_RESP_HDR_LEN + payload_size
+    last_err: ValueError | None = None
+
+    for attempt in range(PARAM_RETRY_COUNT + 1):
+        if attempt > 0:
+            # Drain any stale bytes before re-issuing the request.
+            drain_tx_buffer(bus, address)
+
+        req = VP_REQ_DATA | param_bit
+        _write_request(bus, address, req)
+        time.sleep(SETTLE_SEC)
+
+        raw = _read_bytes(bus, address, total)
+
+        resp_flags = struct.unpack("<I", raw[:VP_RESP_HDR_LEN])[0]
+        if not (resp_flags & VP_REQ_DATA):
+            last_err = ValueError(f"response missing VP_REQ_DATA: 0x{resp_flags:08X}")
+            continue
+        if not (resp_flags & param_bit):
+            last_err = ValueError(
+                f"response param bit mismatch: requested 0x{param_bit:08X} "
+                f"got 0x{resp_flags:08X}"
+            )
+            continue
+
+        return raw[VP_RESP_HDR_LEN:]
+
+    raise last_err  # type: ignore[misc]
+
+
+# ── Payload decoders ─────────────────────────────────────────────────────────
+
+def _decode_u8(raw: bytes) -> int:
+    return raw[0]
+
+
+def _decode_string(raw: bytes) -> str:
     return raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
 
 
-def parse_frame(frame: bytes) -> DeviceState:
-    if len(frame) != FRAME_SIZE:
-        raise ValueError(f"invalid frame size {len(frame)} (expected {FRAME_SIZE})")
-    if frame[0] != FRAME_MAGIC:
-        raise ValueError(f"bad magic 0x{frame[0]:02X}")
-    if frame[1] != FRAME_VERSION:
-        raise ValueError(f"bad version {frame[1]}")
-
-    expected_crc = int.from_bytes(frame[-2:], byteorder="little", signed=False)
-    computed_crc = crc16_ccitt(frame[:-2])
-    if computed_crc != expected_crc:
-        raise ValueError(
-            f"CRC mismatch expected=0x{expected_crc:04X} got=0x{computed_crc:04X}"
-        )
-
-    seq = int.from_bytes(frame[2:6], byteorder="little", signed=False)
-    volume = frame[6]
-    battery = frame[7]
-
-    p = 8
-    ble_addr = decode_fixed_string(frame[p : p + VP_BLE_ADDR_MAX_LEN])
-    p += VP_BLE_ADDR_MAX_LEN
-    param1 = decode_fixed_string(frame[p : p + VP_PARAM_MAX_LEN])
-    p += VP_PARAM_MAX_LEN
-    param2 = decode_fixed_string(frame[p : p + VP_PARAM_MAX_LEN])
-
-    return DeviceState(
-        seq=seq,
-        volume=volume,
-        battery=battery,
-        ble_addr=ble_addr,
-        param1=param1,
-        param2=param2,
-    )
+def apply_param(state: DeviceState, param_bit: int, raw: bytes) -> None:
+    """Parse a raw param payload and update the corresponding DeviceState field."""
+    if param_bit == VP_FLAG_VOL:
+        state.volume = _decode_u8(raw)
+    elif param_bit == VP_FLAG_BAT:
+        state.battery = _decode_u8(raw)
+    elif param_bit == VP_FLAG_ADDR:
+        state.ble_addr = _decode_string(raw)
+    elif param_bit == VP_FLAG_P1:
+        state.param1 = _decode_string(raw)
+    elif param_bit == VP_FLAG_P2:
+        state.param2 = _decode_string(raw)
 
 
-def find_latest_frame(raw: bytes) -> bytes:
-    """Scan the read window and return the valid frame with the highest seq.
-
-    With a 4-frame TX buffer, the window may contain multiple distinct frames.
-    Returning the highest-seq one ensures the RPi always acts on the most
-    recent state rather than the oldest buffered frame.
-    """
-    if len(raw) < FRAME_SIZE:
-        raise ValueError(f"read window too small: {len(raw)} bytes")
-
-    best: bytes | None = None
-    best_seq = -1
-
-    for offset in range(0, len(raw) - FRAME_SIZE + 1):
-        if raw[offset] != FRAME_MAGIC or raw[offset + 1] != FRAME_VERSION:
-            continue
-
-        candidate = raw[offset : offset + FRAME_SIZE]
-        expected_crc = int.from_bytes(candidate[-2:], byteorder="little", signed=False)
-        if crc16_ccitt(candidate[:-2]) != expected_crc:
-            continue
-
-        seq = int.from_bytes(candidate[2:6], byteorder="little", signed=False)
-        if seq > best_seq:
-            best_seq = seq
-            best = candidate
-
-    if best is None:
-        prefix = " ".join(f"{b:02X}" for b in raw[:8])
-        raise ValueError(f"no valid frame found in read window, prefix={prefix}")
-
-    return best
-
-
-def i2c_read_window(bus: SMBus, address: int, size: int) -> bytes:
-    read_msg = i2c_msg.read(address, size)
-    bus.i2c_rdwr(read_msg)
-    return bytes(read_msg)
-
-
-def i2c_read_frame(bus: SMBus, address: int, read_window: int, retry_count: int) -> bytes:
-    last_error: Exception | None = None
-
-    for _ in range(retry_count):
-        raw = i2c_read_window(bus, address, read_window)
-        try:
-            return find_latest_frame(raw)
-        except ValueError as exc:
-            last_error = exc
-
-    if last_error is not None:
-        raise last_error
-
-    raise ValueError("unable to recover a valid frame")
-
-
-def i2c_write_tokens(bus: SMBus, address: int, token_string: str) -> None:
-    data = token_string.encode("utf-8")
-    write_msg = i2c_msg.write(address, data)
-    bus.i2c_rdwr(write_msg)
-
+# ── Main polling loop ────────────────────────────────────────────────────────
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Poll ESP32 shared-state frame over I2C.")
+    parser = argparse.ArgumentParser(
+        description="Poll ESP32 VocalPoint state over I2C (request/response protocol)."
+    )
     parser.add_argument("--bus", type=int, default=1, help="I2C bus number (default: 1)")
     parser.add_argument(
         "--address",
@@ -194,71 +234,67 @@ def main() -> int:
     parser.add_argument(
         "--interval-ms",
         type=int,
-        default=50,
-        help="Polling interval in milliseconds (default: 50)",
-    )
-    parser.add_argument(
-        "--write",
-        type=str,
-        default="",
-        help="Optional token payload to write before each read, e.g. 'VOL=35;P1=hello'",
-    )
-    parser.add_argument(
-        "--read-window",
-        type=int,
-        default=DEFAULT_READ_WINDOW,
-        help=f"Number of bytes to read per poll (default: {DEFAULT_READ_WINDOW})",
-    )
-    parser.add_argument(
-        "--retries",
-        type=int,
-        default=READ_RETRY_COUNT,
-        help=f"Number of read attempts before reporting an error (default: {READ_RETRY_COUNT})",
+        default=100,
+        help="Status poll interval in milliseconds (default: 100)",
     )
     parser.add_argument("--json", action="store_true", help="Print decoded state as JSON")
     args = parser.parse_args()
 
-    if args.read_window < FRAME_SIZE:
-        raise SystemExit(f"--read-window must be at least {FRAME_SIZE}")
-
     print(
-        f"Polling I2C bus={args.bus} addr=0x{args.address:02X} "
-        f"interval={args.interval_ms}ms frame={FRAME_SIZE}B window={args.read_window}B"
+        f"VocalPoint I2C  bus={args.bus} addr=0x{args.address:02X} "
+        f"interval={args.interval_ms}ms  protocol=request_response"
     )
 
-    last_seq: int | None = None
+    state = DeviceState()
+
     with SMBus(args.bus) as bus:
+        # Flush any bytes left in the ESP32 TX FIFO from a previous session.
+        drain_tx_buffer(bus, args.address)
+
         while True:
+            cycle_start = time.monotonic()
             try:
-                if args.write:
-                    i2c_write_tokens(bus, args.address, args.write)
-                    time.sleep(WRITE_SETTLE_SEC)
+                flags = read_status(bus, args.address)
 
-                frame = i2c_read_frame(bus, args.address, args.read_window, args.retries)
-                state = parse_frame(frame)
+                if flags & VP_FLAG_CHANGED:
+                    dirty = flags & VP_PARAM_BITS
+                    changed = False
 
-                if last_seq != state.seq:
-                    save_shared_state(asdict(state), DEFAULT_STATE_PATH)
-                    if args.json:
-                        print(json.dumps(asdict(state), separators=(",", ":")))
-                    else:
-                        print(
-                            f"seq={state.seq} volume={state.volume} battery={state.battery} "
-                            f"addr='{state.ble_addr}' p1='{state.param1}' p2='{state.param2}'"
-                        )
-                    last_seq = state.seq
+                    for param_bit in (VP_FLAG_VOL, VP_FLAG_BAT,
+                                      VP_FLAG_ADDR, VP_FLAG_P1, VP_FLAG_P2):
+                        if not (dirty & param_bit):
+                            continue
+                        try:
+                            raw = read_param(bus, args.address, param_bit)
+                            apply_param(state, param_bit, raw)
+                            changed = True
+                        except (ValueError, OSError) as exc:
+                            field_name = PARAM_FLAG_TO_FIELD.get(param_bit, f"0x{param_bit:02X}")
+                            print(f"param fetch error ({field_name}): {exc}")
+
+                    if changed:
+                        save_shared_state(asdict(state), DEFAULT_STATE_PATH)
+                        if args.json:
+                            print(json.dumps(asdict(state), separators=(",", ":")))
+                        else:
+                            print(
+                                f"volume={state.volume} battery={state.battery} "
+                                f"addr='{state.ble_addr}' "
+                                f"p1='{state.param1}' p2='{state.param2}'"
+                            )
 
             except KeyboardInterrupt:
                 print("\nStopped.")
                 return 0
-            except ValueError:
-                # Empty TX buffer — ESP32 has no new state to report.
-                # This is normal when state is stable; no action needed.
-                pass
+            except OSError as exc:
+                print(f"I2C error: {exc}")
             except Exception as exc:
-                print(f"read error: {exc}")
+                print(f"unexpected error: {exc}")
 
-            time.sleep(args.interval_ms / 1000.0)
+            elapsed = time.monotonic() - cycle_start
+            remaining = args.interval_ms / 1000.0 - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
 
 
 if __name__ == "__main__":
